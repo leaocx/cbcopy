@@ -104,7 +104,7 @@ func (app *Application) SetFlagDefaults(flagSet *pflag.FlagSet) {
 	flagSet.StringSlice(option.DEST_DBNAME, []string{}, "The database(s) in destination cluster to copy to, separated by commas")
 	flagSet.String(option.DEST_HOST, "127.0.0.1", "The host of destination cluster. Must be reachable from the source cluster under --connection-mode push.")
 	flagSet.Int(option.DEST_PORT, 5432, "The port of destination cluster")
-	flagSet.StringSlice(option.DEST_TABLE, []string{}, "The renamed dest table(s) for include-table, separated by commas")
+	flagSet.StringSlice(option.DEST_TABLE, []string{}, "The renamed dest table(s) for include-table, separated by commas. The dest table(s) must already exist on the destination database.")
 	flagSet.String(option.DEST_TABLE_FILE, "", "The renamed dest table(s) for include-table-file, The line format is \"dbname.schema.table\"")
 	flagSet.String(option.DEST_USER, "gpadmin", "The user of destination cluster")
 	flagSet.StringSlice(option.EXCLUDE_TABLE, []string{}, "Copy all tables except the specified table(s), separated by commas")

@@ -300,6 +300,51 @@ func (qm *QueryManager) GetPartitionLeafTables(conn *dbconn.DBConn) ([]PartLeafT
 	return results, nil
 }
 
+// GetLeafTablesOfIntermediate returns the leaf descendants of an intermediate
+// partition table by recursively traversing pg_inherits. Leaves are tables
+// that have no children. Returns nil if the table has no children (not intermediate).
+func (qm *QueryManager) GetLeafTablesOfIntermediate(conn *dbconn.DBConn, schema, name string) ([]option.Table, error) {
+	query := fmt.Sprintf(`
+		WITH RECURSIVE part_tree AS (
+			SELECT inhrelid AS oid FROM pg_inherits WHERE inhparent = (
+				SELECT c.oid FROM pg_class c JOIN pg_namespace n ON c.relnamespace=n.oid
+				WHERE n.nspname='%s' AND c.relname='%s'
+			)
+			UNION ALL
+			SELECT i.inhrelid FROM pg_inherits i JOIN part_tree pt ON i.inhparent = pt.oid
+		)
+		SELECT quote_ident(n.nspname) AS schema, quote_ident(c.relname) AS name,
+		       cast(c.reltuples as bigint) AS reltuples
+		FROM part_tree pt
+		JOIN pg_class c ON pt.oid = c.oid
+		JOIN pg_namespace n ON c.relnamespace = n.oid
+		WHERE NOT EXISTS(SELECT 1 FROM pg_inherits WHERE inhparent = c.oid)
+		ORDER BY n.nspname, c.relname`,
+		utils.EscapeSingleQuotes(schema), utils.EscapeSingleQuotes(name))
+
+	gplog.Debug("GetLeafTablesOfIntermediate, query is %v", query)
+
+	type leafResult struct {
+		Schema    string
+		Name      string
+		RelTuples int64 `db:"reltuples"`
+	}
+	results := make([]leafResult, 0)
+	err := conn.Select(&results, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get leaf tables of intermediate partition: %v", err)
+	}
+	if len(results) == 0 {
+		return nil, nil
+	}
+
+	tables := make([]option.Table, 0, len(results))
+	for _, r := range results {
+		tables = append(tables, option.Table{Schema: r.Schema, Name: r.Name, Partition: 0, RelTuples: r.RelTuples})
+	}
+	return tables, nil
+}
+
 // CreateTestTable creates an test table with a single integer column
 func (qm *QueryManager) CreateTestTable(conn *dbconn.DBConn, tableName string) error {
 	query := fmt.Sprintf(`CREATE TABLE %v (a int)`, tableName)

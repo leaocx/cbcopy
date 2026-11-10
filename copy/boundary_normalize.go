@@ -59,8 +59,10 @@ var (
 	// GP6: pg_get_partition_rule_def output.
 	// Applied after preprocessing strips EVERY (...), WITH (...), and type casts.
 	// After preprocessing, bounds are clean: START ('val') or START (val)
-	reGP6RuleRange = regexp.MustCompile(`(?i)START\s*\(\s*'?(\(?[^')]+?\)?)'?\s*\)\s*(INCLUSIVE|EXCLUSIVE)?\s*END\s*\(\s*'?(\(?[^')]+?\)?)'?\s*\)\s*(INCLUSIVE|EXCLUSIVE)?`)
-	reGP6RuleList  = regexp.MustCompile(`(?i)\bVALUES\s*\(([^)]+)\)`)
+	reGP6RuleRange    = regexp.MustCompile(`(?i)START\s*\(\s*'?(\(?[^')]+?\)?)'?\s*\)\s*(INCLUSIVE|EXCLUSIVE)?\s*END\s*\(\s*'?(\(?[^')]+?\)?)'?\s*\)\s*(INCLUSIVE|EXCLUSIVE)?`)
+	reGP6RuleEndOnly  = regexp.MustCompile(`(?i)END\s*\(\s*'?(\(?[^')]+?\)?)'?\s*\)\s*(INCLUSIVE|EXCLUSIVE)?`)
+	reGP6RuleStartOnly = regexp.MustCompile(`(?i)START\s*\(\s*'?(\(?[^')]+?\)?)'?\s*\)\s*(INCLUSIVE|EXCLUSIVE)?`)
+	reGP6RuleList     = regexp.MustCompile(`(?i)\bVALUES\s*\(([^)]+)\)`)
 
 	// Preprocess helpers for GP6 boundary strings.
 	reStripEvery = regexp.MustCompile(`(?i)\s+EVERY\s*\([^)]*\)`)
@@ -75,6 +77,8 @@ var (
 // Recognised formats (after preprocessing strips EVERY/WITH suffixes):
 //
 //	RANGE:   "[PARTITION <n>] START (<val>[::type]) [INCLUSIVE|EXCLUSIVE] END (<val>[::type]) [INCLUSIVE|EXCLUSIVE]"
+//	RANGE:   "[PARTITION <n>] END (<val>[::type]) [INCLUSIVE|EXCLUSIVE]"         (first partition, open start)
+//	RANGE:   "[PARTITION <n>] START (<val>[::type]) [INCLUSIVE|EXCLUSIVE]"       (last partition, open end)
 //	LIST:    "[PARTITION|SUBPARTITION <n>] VALUES(<v1>, <v2>)"
 //	DEFAULT: "DEFAULT [SUB]PARTITION <n> ..."
 func normalizeGP6RuleDef(s string) string {
@@ -90,7 +94,7 @@ func normalizeGP6RuleDef(s string) string {
 	cleaned = reStripWith.ReplaceAllString(cleaned, "")
 	cleaned = reStripCast.ReplaceAllString(cleaned, "")
 
-	// RANGE: START ... END ...
+	// RANGE: START ... END ... (closed interval)
 	if m := reGP6RuleRange.FindStringSubmatch(cleaned); len(m) >= 4 {
 		start := stripBoundaryValue(m[1])
 		end := stripBoundaryValue(m[3])
@@ -105,6 +109,26 @@ func normalizeGP6RuleDef(s string) string {
 			rb = "]"
 		}
 		return fmt.Sprintf("RANGE:%s%s,%s%s", lb, start, end, rb)
+	}
+
+	// RANGE: END only (first partition, open start — maps to MINVALUE)
+	if m := reGP6RuleEndOnly.FindStringSubmatch(cleaned); len(m) >= 2 {
+		end := stripBoundaryValue(m[1])
+		rb := ")"
+		if len(m) >= 3 && strings.ToUpper(strings.TrimSpace(m[2])) == "INCLUSIVE" {
+			rb = "]"
+		}
+		return fmt.Sprintf("RANGE:[MINVALUE,%s%s", end, rb)
+	}
+
+	// RANGE: START only (last partition, open end — maps to MAXVALUE)
+	if m := reGP6RuleStartOnly.FindStringSubmatch(cleaned); len(m) >= 2 {
+		start := stripBoundaryValue(m[1])
+		lb := "["
+		if len(m) >= 3 && strings.ToUpper(strings.TrimSpace(m[2])) == "EXCLUSIVE" {
+			lb = "("
+		}
+		return fmt.Sprintf("RANGE:%s%s,MAXVALUE)", lb, start)
 	}
 
 	// LIST: VALUES(...)
@@ -147,15 +171,28 @@ func stripBoundaryValue(s string) string {
 	return stripSingleQuotes(s)
 }
 
-// splitListValues splits "val1, val2, ..." and strips surrounding single quotes.
+// splitListValues splits "val1, val2, ..." using quote-aware splitting
+// and strips surrounding single quotes from each value.
+// Values containing commas inside single quotes (e.g. 'a,b') are kept intact.
 func splitListValues(s string) []string {
-	parts := strings.Split(s, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		v := stripSingleQuotes(strings.TrimSpace(p))
-		if v != "" {
-			out = append(out, v)
+	out := make([]string, 0)
+	inQuote := false
+	start := 0
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\'' {
+			inQuote = !inQuote
+		} else if s[i] == ',' && !inQuote {
+			v := stripSingleQuotes(strings.TrimSpace(s[start:i]))
+			if v != "" {
+				out = append(out, v)
+			}
+			start = i + 1
 		}
+	}
+	// Last value
+	v := stripSingleQuotes(strings.TrimSpace(s[start:]))
+	if v != "" {
+		out = append(out, v)
 	}
 	return out
 }

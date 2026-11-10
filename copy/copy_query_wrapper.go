@@ -170,15 +170,17 @@ func (qw *QueryWrapper) GetUserTables(srcConn, destConn *dbconn.DBConn) ([]optio
 		if utils.MustGetFlagBool(option.SKIP_EXISTING) {
 			qw.loadDestInventory(destConn)
 		}
-		return results, qw.redirectSchemaTables(results), nil, qw.getPartitionTableMapping(srcConn, destConn, false)
+		destResults := qw.redirectSchemaTables(results)
+		srcPaired, destPaired := qw.boundaryPairExpandedTables(srcConn, destConn, results, destResults)
+		return srcPaired, destPaired, nil, qw.getPartitionTableMapping(srcConn, destConn, false)
 	}
 
 	// Handle table mode
 	config.MarkIncludeTables(srcConn.DBName, srcTables, srcDbPartTables)
 	if len(config.GetDestTablesByDb(destConn.DBName)) == 0 {
-		expandedTables, pendingCheckRels, err := qw.expandPartTables(srcConn, srcTables, config.GetIncludeTablesByDb(srcConn.DBName))
+		expandedSrcTables, pendingCheckRels, err := qw.expandPartTables(srcConn, srcTables, config.GetIncludeTablesByDb(srcConn.DBName))
 		gplog.FatalOnError(err)
-		excludedSrcTables := qw.excludeTables(expandedTables, exlTabs)
+		excludedSrcTables := qw.excludeTables(expandedSrcTables, exlTabs)
 		excludedPendingCheckRels := qw.excludeTables(pendingCheckRels, exlTabs)
 
 		gplog.Info("Retrieving view, mat-view, sequence, foreigntable \"%v\" on source database...", srcConn.DBName)
@@ -192,7 +194,9 @@ func (qw *QueryWrapper) GetUserTables(srcConn, destConn *dbconn.DBConn) ([]optio
 		if utils.MustGetFlagBool(option.SKIP_EXISTING) {
 			qw.loadDestInventory(destConn)
 		}
-		return excludedSrcTables, qw.redirectIncludeTables(excludedSrcTables), nonPhysicalRels, qw.getPartitionTableMapping(srcConn, destConn, false)
+		destResults := qw.redirectIncludeTables(excludedSrcTables)
+		srcPaired, destPaired := qw.boundaryPairExpandedTables(srcConn, destConn, excludedSrcTables, destResults)
+		return srcPaired, destPaired, nonPhysicalRels, qw.getPartitionTableMapping(srcConn, destConn, false)
 	}
 
 	return qw.processDestinationTables(srcConn, destConn, srcTables)
@@ -418,11 +422,154 @@ func (qw *QueryWrapper) expandPartTables(conn *dbconn.DBConn, userTables map[str
 				IsReplicated: stat.IsReplicated,
 			}
 		} else {
+			// Check if this is an intermediate partition (has children but is not a root)
+			leaves, err := qw.queryManager.GetLeafTablesOfIntermediate(conn, t.Schema, t.Name)
+			if err == nil && expandIntermediateLeaves(expandMap, leaves) {
+				gplog.Info("Expanding intermediate partition %q to %d leaf table(s)", fqn, len(leaves))
+				continue
+			}
 			pendingCheckRels[fqn] = option.TableStatistics{Partition: 0, RelTuples: t.RelTuples}
 		}
 	}
 
 	return expandMap, pendingCheckRels, nil
+}
+
+// expandIntermediateLeaves adds leaf tables of an intermediate partition to the
+// expand map. Returns true if leaves were found and added, false otherwise.
+// This is a pure function (no DB access) for testability.
+func expandIntermediateLeaves(expandMap map[string]option.TableStatistics, leaves []option.Table) bool {
+	if len(leaves) == 0 {
+		return false
+	}
+	for _, leaf := range leaves {
+		k := leaf.Schema + "." + leaf.Name
+		expandMap[k] = option.TableStatistics{Partition: 0, RelTuples: leaf.RelTuples}
+	}
+	return true
+}
+
+// boundaryPairExpandedTables re-pairs partition leaf tables using boundary-based
+// matching instead of name-based matching. For non-partition tables, the original
+// pairing (by array index) is preserved. This ensures correct leaf-to-leaf mapping
+// even when leaf names differ (name drift) or across database versions.
+func (qw *QueryWrapper) boundaryPairExpandedTables(srcConn, destConn *dbconn.DBConn,
+	srcTables, destTables []option.Table) ([]option.Table, []option.Table) {
+
+	if destConn == nil {
+		return srcTables, destTables
+	}
+
+	srcLeaves, err := qw.GetPartitionLeafTables(srcConn, false)
+	if err != nil {
+		gplog.Warn("boundary pairing: cannot read source leaves (%v); keeping name-based pairing", err)
+		return srcTables, destTables
+	}
+	destLeaves, err := qw.GetPartitionLeafTables(destConn, true)
+	if err != nil {
+		gplog.Warn("boundary pairing: cannot read dest leaves (%v); keeping name-based pairing", err)
+		return srcTables, destTables
+	}
+
+	// Build root lookup: src leaf FQN → root FQN
+	srcLeafToRoot := make(map[string]string)
+	for _, l := range srcLeaves {
+		srcLeafToRoot[l.LeafName] = l.RootName
+	}
+
+	// Group src tables by root (partition leaves vs non-partition tables)
+	type indexedTable struct {
+		index int
+		table option.Table
+	}
+	rootSrcLeaves := make(map[string][]indexedTable) // rootFqn → src leaves with original indices
+	var nonPartIndices []int
+
+	for i, t := range srcTables {
+		srcFqn := t.Schema + "." + t.Name
+		rootFqn, isLeaf := srcLeafToRoot[srcFqn]
+		if isLeaf {
+			rootSrcLeaves[rootFqn] = append(rootSrcLeaves[rootFqn], indexedTable{index: i, table: t})
+		} else {
+			nonPartIndices = append(nonPartIndices, i)
+		}
+	}
+
+	// If no partition tables, nothing to re-pair
+	if len(rootSrcLeaves) == 0 {
+		return srcTables, destTables
+	}
+
+	// Build result slices: start with non-partition tables (preserve original pairing)
+	newSrc := make([]option.Table, 0, len(srcTables))
+	newDst := make([]option.Table, 0, len(destTables))
+	for _, idx := range nonPartIndices {
+		newSrc = append(newSrc, srcTables[idx])
+		if idx < len(destTables) {
+			newDst = append(newDst, destTables[idx])
+		}
+	}
+
+	// Re-pair partition leaves by boundary for each root
+	for rootFqn := range rootSrcLeaves {
+		destRootFqn := qw.resolveDestRootFqn(rootFqn)
+		srcRootLeaves := leavesByRoot(srcLeaves, rootFqn)
+		destRootLeaves := leavesByRoot(destLeaves, destRootFqn)
+
+		if len(destRootLeaves) == 0 {
+			// No dest leaves — keep original name-based pairing
+			for _, it := range rootSrcLeaves[rootFqn] {
+				newSrc = append(newSrc, it.table)
+				if it.index < len(destTables) {
+					newDst = append(newDst, destTables[it.index])
+				}
+			}
+			continue
+		}
+
+		matchedSrc, matchedDst, _ := matchLeavesByBoundary(srcRootLeaves, destRootLeaves)
+		if len(matchedSrc) > 0 {
+			for i := range matchedSrc {
+				newSrc = append(newSrc, matchedSrc[i])
+				newDst = append(newDst, matchedDst[i])
+			}
+		} else {
+			// Zero boundary matches — keep original name-based pairing
+			for _, it := range rootSrcLeaves[rootFqn] {
+				newSrc = append(newSrc, it.table)
+				if it.index < len(destTables) {
+					newDst = append(newDst, destTables[it.index])
+				}
+			}
+		}
+	}
+
+	return newSrc, newDst
+}
+
+// resolveDestRootFqn maps a source root FQN to its destination root FQN
+// based on schema redirect configuration.
+func (qw *QueryWrapper) resolveDestRootFqn(srcRootFqn string) string {
+	sl := strings.Split(srcRootFqn, ".")
+	if len(sl) != 2 {
+		return srcRootFqn
+	}
+	srcSchema := sl[0]
+	tableName := sl[1]
+
+	// Check schema mapping (--dest-schema / --schema-mapping-file)
+	if schemaMap := config.GetSchemaMap(); len(schemaMap) > 0 {
+		if ds, exists := schemaMap[srcSchema]; exists {
+			return ds + "." + tableName
+		}
+	}
+
+	// Check dest schemas for include-table mode
+	if destSchemas := config.GetDestSchemas(); len(destSchemas) > 0 {
+		return destSchemas[0].Schema + "." + tableName
+	}
+
+	return srcRootFqn
 }
 
 // ResetCache resets the partition leaf table cache
